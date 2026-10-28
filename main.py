@@ -1,11 +1,10 @@
 
 import re
+import os
 import aiohttp
 import discord
 from bs4 import BeautifulSoup
 from discord import app_commands
-
-import os
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 BASE_URL = "https://tekkendocs.com/t7"
@@ -13,7 +12,6 @@ BASE_URL = "https://tekkendocs.com/t7"
 
 def normalize_move(move: str) -> str:
     move = re.sub(r"\s+", "", move.lower())
-    # Treat b1 and b+1 as equivalent, while preserving button combinations
     move = re.sub(r"(?<=[a-z])\+(?=\d)", "", move)
     return move
 
@@ -57,7 +55,7 @@ tree = app_commands.CommandTree(client)
 
 @tree.command(
     name="fd",
-    description="Look up Tekken 7 move frame data from TekkenDocs"
+    description="Look up Tekken 7 move frame data"
 )
 @app_commands.describe(
     character="Character name, e.g. bryan",
@@ -71,8 +69,9 @@ async def fd(
     await interaction.response.defer(thinking=True)
 
     character = re.sub(r"[^a-z0-9]", "", character.lower())
+    move = move.strip()
 
-    if not character or not move.strip():
+    if not character or not move:
         await interaction.followup.send(
             "Please provide a character and a move."
         )
@@ -93,8 +92,7 @@ async def fd(
             async with session.get(url) as response:
                 if response.status != 200:
                     await interaction.followup.send(
-                        f"TekkenDocs returned HTTP {response.status} "
-                        f"for `{character}`. Check the character name."
+                        f"Character `{character}` not found on TekkenDocs."
                     )
                     return
 
@@ -105,9 +103,9 @@ async def fd(
         if row is None:
             soup = BeautifulSoup(html, "html.parser")
             has_command_table = any(
-                (cells := table.find_all("tr"))
-                and cells[0].find(["th", "td"])
-                and cells[0].find(["th", "td"]).get_text(
+                (rows := table.find_all("tr"))
+                and rows[0].find(["th", "td"])
+                and rows[0].find(["th", "td"]).get_text(
                     " ", strip=True
                 ).lower() == "command"
                 for table in soup.find_all("table")
@@ -115,39 +113,45 @@ async def fd(
 
             if not has_command_table:
                 await interaction.followup.send(
-                    "I couldn't read the frame-data table on TekkenDocs. "
-                    "The page layout may have changed."
+                    "Couldn't read the frame-data table on TekkenDocs."
                 )
             else:
                 await interaction.followup.send(
-                    f"No exact match for `{move}` found in TekkenDocs "
-                    f"T7 data for `{character}`."
+                    f"No match for `{move}` found for `{character}`."
                 )
             return
 
         command = row.pop("Command", move)
+
         embed = discord.Embed(
             title=f"{character.title()} — {command}",
             url=url,
-            description="Source: TekkenDocs · Tekken 7",
             color=discord.Color.blurple()
         )
 
+        labels = {
+            "Start up frame": "Startup",
+            "Startup frame": "Startup",
+            "Block frame": "Block",
+            "Hit frame": "Hit",
+            "Counter hit frame": "Counter hit",
+        }
+
         for key, value in row.items():
             if value:
+                clean_key = labels.get(key, key)
                 embed.add_field(
-                    name=key[:256],
-                    value=value[:1024],
+                    name=clean_key,
+                    value=value,
                     inline=True
                 )
 
-        embed.set_footer(text="Data source: TekkenDocs · Tekken 7")
         await interaction.followup.send(embed=embed)
 
     except aiohttp.ClientError as error:
         print(f"TekkenDocs request error: {error}")
         await interaction.followup.send(
-            "Couldn't connect to TekkenDocs. Please try again later."
+            "Couldn't connect to TekkenDocs. Try again later."
         )
     except Exception as error:
         print(f"Frame-data lookup error: {error}")
