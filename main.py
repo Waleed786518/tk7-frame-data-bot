@@ -117,34 +117,23 @@ async def fd(
             "Counter hit frame": "Counter hit",
         }
 
-        items = [
-            (labels.get(key, key), str(value))
-            for key, value in row.items()
-            if value
-        ]
-
-        # Calculate each column width independently.
-        widths = [
-            max(len(label), len(value)) + 2
-            for label, value in items
-        ]
-
-        headings = "".join(
-            label.center(width)
-            for (label, value), width in zip(items, widths)
-        ).rstrip()
-
-        values = "".join(
-            value.center(width)
-            for (label, value), width in zip(items, widths)
-        ).rstrip()
-
         embed = discord.Embed(
             title=f"{character.title()} — {command}",
             url=url,
-            description=f"```text\n{headings}\n{values}\n```",
             color=discord.Color.blurple()
         )
+
+        for key, value in row.items():
+            if not value:
+                continue
+
+            label = labels.get(key, key)
+
+            embed.add_field(
+                name=label,
+                value=value,
+                inline=True
+            )
 
         await interaction.followup.send(embed=embed)
 
