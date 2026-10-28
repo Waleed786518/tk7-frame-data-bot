@@ -301,7 +301,6 @@ async def fd(
             )
             return
 
-        embed.set_footer(text="Source: TekkenDocs · Tekken 7")
         await interaction.followup.send(embed=embed)
 
     except ValueError as error:
