@@ -12,8 +12,7 @@ BASE_URL = "https://tekkendocs.com/t7"
 
 def normalize_move(move: str) -> str:
     move = re.sub(r"\s+", "", move.lower())
-    move = re.sub(r"(?<=[a-z])\+(?=\d)", "", move)
-    return move
+    return re.sub(r"(?<=[a-z])\+(?=\d)", "", move)
 
 
 def get_frame_data(html: str, requested_move: str):
@@ -101,35 +100,16 @@ async def fd(
         row = get_frame_data(html, move)
 
         if row is None:
-            soup = BeautifulSoup(html, "html.parser")
-            has_command_table = any(
-                (rows := table.find_all("tr"))
-                and rows[0].find(["th", "td"])
-                and rows[0].find(["th", "td"]).get_text(
-                    " ", strip=True
-                ).lower() == "command"
-                for table in soup.find_all("table")
+            await interaction.followup.send(
+                f"No match for `{move}` found for `{character}` on TekkenDocs."
             )
-
-            if not has_command_table:
-                await interaction.followup.send(
-                    "Couldn't read the frame-data table on TekkenDocs."
-                )
-            else:
-                await interaction.followup.send(
-                    f"No match for `{move}` found for `{character}`."
-                )
             return
 
         command = row.pop("Command", move)
 
-        embed = discord.Embed(
-            title=f"{character.title()} — {command}",
-            url=url,
-            color=discord.Color.blurple()
-        )
-
         labels = {
+            "Hit level": "Hit level",
+            "Damage": "Damage",
             "Start up frame": "Startup",
             "Startup frame": "Startup",
             "Block frame": "Block",
@@ -137,21 +117,41 @@ async def fd(
             "Counter hit frame": "Counter hit",
         }
 
-        for key, value in row.items():
-            if value:
-                clean_key = labels.get(key, key)
-                embed.add_field(
-                    name=clean_key,
-                    value=value,
-                    inline=True
-                )
+        items = [
+            (labels.get(key, key), str(value))
+            for key, value in row.items()
+            if value
+        ]
+
+        # Calculate each column width independently.
+        widths = [
+            max(len(label), len(value)) + 2
+            for label, value in items
+        ]
+
+        headings = "".join(
+            label.center(width)
+            for (label, value), width in zip(items, widths)
+        ).rstrip()
+
+        values = "".join(
+            value.center(width)
+            for (label, value), width in zip(items, widths)
+        ).rstrip()
+
+        embed = discord.Embed(
+            title=f"{character.title()} — {command}",
+            url=url,
+            description=f"```text\n{headings}\n{values}\n```",
+            color=discord.Color.blurple()
+        )
 
         await interaction.followup.send(embed=embed)
 
     except aiohttp.ClientError as error:
         print(f"TekkenDocs request error: {error}")
         await interaction.followup.send(
-            "Couldn't connect to TekkenDocs. Try again later."
+            "Couldn't connect to TekkenDocs. Please try again later."
         )
     except Exception as error:
         print(f"Frame-data lookup error: {error}")
