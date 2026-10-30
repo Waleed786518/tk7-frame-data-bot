@@ -1,338 +1,202 @@
-
+```python
 import os
 import re
-import time
-
-import aiohttp
 import discord
-from bs4 import BeautifulSoup
+
 from discord import app_commands
+from discord.ext import commands
+
+from tekkendocs import (
+    source,
+    TekkenDocsError,
+    SourceUnavailable,
+    CharacterNotFound,
+)
+
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 
-BASE_URL = "https://tekkendocs.com/t7"
-CACHE_TTL = 300
-REQUEST_TIMEOUT = 20
-
-# TekkenDocs Tekken 7 character slugs.
-# Character aliases are intentionally excluded.
-CHARACTERS = {
-    "akuma": "Akuma",
-    "alisa": "Alisa",
-    "anna": "Anna",
-    "armor-king": "Armor King",
-    "asuka": "Asuka",
-    "bob": "Bob",
-    "bryan": "Bryan",
-    "claudio": "Claudio",
-    "devil-jin": "Devil Jin",
-    "dragunov": "Dragunov",
-    "eddy": "Eddy",
-    "eliza": "Eliza",
-    "fahkumram": "Fahkumram",
-    "feng": "Feng",
-    "ganryu": "Ganryu",
-    "geese": "Geese",
-    "gigas": "Gigas",
-    "heihachi": "Heihachi",
-    "hwoarang": "Hwoarang",
-    "jack-7": "Jack 7",
-    "jin": "Jin",
-    "josie": "Josie",
-    "julia": "Julia",
-    "katarina": "Katarina",
-    "kazumi": "Kazumi",
-    "kazuya": "Kazuya",
-    "king": "King",
-    "kuma": "Kuma",
-    "kunimitsu": "Kunimitsu",
-    "lars": "Lars",
-    "law": "Law",
-    "lee": "Lee",
-    "lei": "Lei",
-    "leo": "Leo",
-    "leroy": "Leroy",
-    "lidia": "Lidia",
-    "lili": "Lili",
-    "lucky-chloe": "Lucky Chloe",
-    "marduk": "Marduk",
-    "master-raven": "Master Raven",
-    "miguel": "Miguel",
-    "negan": "Negan",
-    "nina": "Nina",
-    "noctis": "Noctis",
-    "paul": "Paul",
-    "shaheen": "Shaheen",
-    "steve": "Steve",
-    "xiaoyu": "Xiaoyu",
-    "yoshimitsu": "Yoshimitsu",
-    "zafina": "Zafina",
-}
-
-# character slug -> (timestamp, HTML)
-page_cache = {}
+intents = discord.Intents.default()
 
 
-def normalize_character(character: str) -> str:
-    """Normalize a character's spelling and spacing, not aliases."""
-    character = character.strip().lower()
-    character = re.sub(r"\s+", "-", character)
-    return re.sub(r"[^a-z0-9-]", "", character)
+def normalize_character(value):
+    value = value.strip().lower()
+    value = value.replace("&", "and")
+    value = re.sub(r"\s+", "-", value)
+    value = re.sub(r"[^a-z0-9-]", "", value)
+    return value.strip("-")
 
 
-def normalize_move(move: str) -> str:
-    """
-    Normalize harmless notation differences.
-    Keep plus signs between buttons and commas between moves.
-    """
-    move = re.sub(r"\s+", "", move.lower())
+def normalize_move(value):
+    value = value.strip().casefold()
+    value = re.sub(r"\s+", "", value)
 
-    # Diagonal direction shortcuts:
-    # df3 / df+3 -> d/f+3
-    # db2 / db+2 -> d/b+2
-    # uf4 / uf+4 -> u/f+4
-    # ub1 / ub+1 -> u/b+1
-    move = re.sub(r"(?<![a-z])df(?=\+?\d)", "d/f", move)
-    move = re.sub(r"(?<![a-z])db(?=\+?\d)", "d/b", move)
-    move = re.sub(r"(?<![a-z])uf(?=\+?\d)", "u/f", move)
-    move = re.sub(r"(?<![a-z])ub(?=\+?\d)", "u/b", move)
-
-    # ff2 / ff+2 -> f,f+2.
-    # Only normalize double-forward notation before a button number.
-    move = re.sub(r"(?<![a-z])ff(?=\+?\d)", "f,f", move)
-
-    # Allow b1 / b+1 and f1+2 / f+1+2 to match.
-    # This does NOT remove the plus between 1 and 2.
-    move = re.sub(r"(?<=[a-z])\+(?=\d)", "", move)
-
-    return move
-
-
-def get_frame_data(html: str, requested_move: str):
-    soup = BeautifulSoup(html, "html.parser")
-    target = normalize_move(requested_move)
-
-    for table in soup.find_all("table"):
-        rows = table.find_all("tr")
-        header_index = None
-        headers = []
-
-        # Find the actual Command header row.
-        for index, tr in enumerate(rows):
-            candidate = [
-                cell.get_text(" ", strip=True)
-                for cell in tr.find_all(["th", "td"])
-            ]
-
-            if candidate and candidate[0].strip().lower() == "command":
-                header_index = index
-                headers = candidate
-                break
-
-        if header_index is None:
-            continue
-
-        for tr in rows[header_index + 1:]:
-            cells = [
-                cell.get_text(" ", strip=True)
-                for cell in tr.find_all(["th", "td"])
-            ]
-
-            if len(cells) != len(headers) or not cells:
-                continue
-
-            if not cells[0]:
-                continue
-
-            if normalize_move(cells[0]) == target:
-                return dict(zip(headers, cells))
-
-    return None
-
-
-def page_has_command_table(html: str) -> bool:
-    soup = BeautifulSoup(html, "html.parser")
-
-    for table in soup.find_all("table"):
-        for row in table.find_all("tr"):
-            cells = row.find_all(["th", "td"])
-
-            if (
-                cells
-                and cells[0].get_text(" ", strip=True).lower()
-                == "command"
-            ):
-                return True
-
-    return False
-
-
-async def fetch_character_page(character: str) -> str:
-    """Fetch a page and reuse a cached copy for five minutes."""
-    now = time.monotonic()
-    cached = page_cache.get(character)
-
-    if cached and now - cached[0] < CACHE_TTL:
-        return cached[1]
-
-    url = f"{BASE_URL}/{character}"
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; TK7-FD Discord bot)"
+    replacements = {
+        "df": "d/f",
+        "db": "d/b",
+        "uf": "u/f",
+        "ub": "u/b",
+        "ff": "f,f",
     }
 
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        headers=headers,
-    ) as session:
-        async with session.get(url) as response:
-            if response.status == 404:
-                raise ValueError("CHARACTER_NOT_FOUND")
+    for old, new in replacements.items():
+        value = re.sub(rf"(?<![a-z]){old}(?=\+?\d)", new, value)
 
-            if response.status == 429:
-                raise ValueError("RATE_LIMITED")
+    # d/f1 becomes d/f+1; 1+2 remains unchanged.
+    value = re.sub(r"([dfub])(\d)", r"\1+\2", value)
+    value = re.sub(r"([dfub])([dfub])(\d)", r"\1/\2+\3", value)
 
-            if response.status >= 500:
-                raise ValueError("WEBSITE_ERROR")
-
-            if response.status != 200:
-                raise ValueError("REQUEST_ERROR")
-
-            html = await response.text()
-
-    if not html.strip():
-        raise ValueError("EMPTY_PAGE")
-
-    if not page_has_command_table(html):
-        raise ValueError("UNEXPECTED_PAGE")
-
-    page_cache[character] = (time.monotonic(), html)
-    return html
+    return value
 
 
-class TK7Client(discord.Client):
+def move_matches(query, command):
+    return normalize_move(query) == normalize_move(command)
+
+
+def make_embed(character_name, move, stale=False):
+    slug = move.get("characterId", "")
+    command = move.get("command", "Unknown move")
+
+    embed = discord.Embed(
+        title=f"{character_name} — {command}",
+        url=f"https://tekkendocs.com/{slug}/{command}",
+        color=discord.Color.blurple(),
+    )
+
+    fields = [
+        ("Hit level", "hitLevel"),
+        ("Damage", "damage"),
+        ("Startup", "startup"),
+        ("On block", "block"),
+        ("On hit", "hit"),
+        ("Counter hit", "counterHit"),
+    ]
+
+    for label, key in fields:
+        value = move.get(key)
+        if value is not None and str(value).strip():
+            embed.add_field(
+                name=label,
+                value=str(value),
+                inline=True,
+            )
+
+    notes = move.get("notes")
+    if notes and str(notes).strip():
+        embed.add_field(
+            name="Notes",
+            value=str(notes),
+            inline=False,
+        )
+
+    if stale:
+        embed.set_footer(
+            text="TekkenDocs is unavailable. Showing previously cached data; it may be outdated."
+        )
+    else:
+        embed.set_footer(text="Frame data source: TekkenDocs / RBNorway")
+
+    return embed
+
+
+class Tekken7Client(commands.Bot):
     async def setup_hook(self):
-        # Register slash commands once when the bot starts.
-        await tree.sync()
+        await source.start()
+        await self.tree.sync()
+
+    async def close(self):
+        await source.close()
+        await super().close()
 
 
-intents = discord.Intents.default()
-client = TK7Client(intents=intents)
-tree = app_commands.CommandTree(client)
+client = Tekken7Client(
+    command_prefix="!",
+    intents=intents,
+)
 
 
-@tree.command(
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user}.")
+
+
+@client.tree.command(
     name="fd",
-    description="Look up Tekken 7 move frame data",
+    description="Look up Tekken 7 frame data for a character move.",
 )
 @app_commands.describe(
     character="Tekken 7 character",
-    move="Move notation, e.g. b+1, df+3, or 1,2",
+    move="Move notation, e.g. df1, 1+2, or qcf2",
 )
 async def fd(
     interaction: discord.Interaction,
     character: str,
     move: str,
 ):
-    await interaction.response.defer(thinking=True)
-
-    character = normalize_character(character)
-    move = move.strip()
-
-    if not character or character not in CHARACTERS:
-        await interaction.followup.send(
-            "Character not found. Select a valid Tekken 7 character."
-        )
-        return
-
-    if not move:
-        await interaction.followup.send(
-            "Enter a move, e.g. `/fd bryan b+1`."
-        )
-        return
-
-    url = f"{BASE_URL}/{character}"
+    await interaction.response.defer()
 
     try:
-        html = await fetch_character_page(character)
-        row = get_frame_data(html, move)
+        roster = await source.get_roster()
+        character_slug = normalize_character(character)
 
-        if row is None:
-            await interaction.followup.send(
-                f"Move `{move}` not found. Check notation, "
-                "e.g. `d/f+1`, and try again."
-            )
-            return
+        # Resolve either the source slug or the displayed character name.
+        if character_slug not in roster:
+            matches = [
+                slug for slug, name in roster.items()
+                if normalize_character(name) == character_slug
+            ]
+            if not matches:
+                await interaction.followup.send(
+                    f"Character **{character}** was not found in the TekkenDocs Tekken 7 roster."
+                )
+                return
+            character_slug = matches[0]
 
-        command = row.get("Command", move)
+        character_data, stale = await source.get_character(character_slug)
+        moves = character_data["framesNormal"]
 
-        labels = {
-            "Hit level": "Hit level",
-            "Damage": "Damage",
-            "Start up frame": "Startup",
-            "Startup frame": "Startup",
-            "Block frame": "Block",
-            "Hit frame": "Hit",
-            "Counter hit frame": "Counter hit",
-        }
-
-        embed = discord.Embed(
-            title=f"{CHARACTERS[character]} — {command}",
-            url=url,
-            color=discord.Color.blurple(),
+        found = next(
+            (
+                item for item in moves
+                if move_matches(move, item.get("command", ""))
+            ),
+            None,
         )
 
-        field_count = 0
-
-        for key, value in row.items():
-            if key.strip().lower() == "command" or not value:
-                continue
-
-            embed.add_field(
-                name=labels.get(key, key),
-                value=value[:1024],
-                inline=True,
-            )
-            field_count += 1
-
-        if field_count == 0:
+        if not found:
             await interaction.followup.send(
-                "Frame data unreadable. Try again later."
+                f"Move **{move}** was not found for **{character_data['characterName']}**."
             )
             return
+
+        found = dict(found)
+        found["characterId"] = character_slug
+
+        embed = make_embed(
+            character_data["characterName"],
+            found,
+            stale=stale,
+        )
 
         await interaction.followup.send(embed=embed)
 
-    except ValueError as error:
-        messages = {
-            "CHARACTER_NOT_FOUND":
-                "Character page not found. Check the character name.",
-            "RATE_LIMITED":
-                "Rate limited by TekkenDocs. Wait, then retry.",
-            "WEBSITE_ERROR":
-                "TekkenDocs server error. Try again shortly.",
-            "REQUEST_ERROR":
-                "TekkenDocs request failed. Try again shortly.",
-            "EMPTY_PAGE":
-                "TekkenDocs returned an empty page. Retry shortly.",
-            "UNEXPECTED_PAGE":
-                "Frame data unreadable. Try again later.",
-        }
+    except CharacterNotFound as exc:
+        await interaction.followup.send(str(exc))
 
+    except SourceUnavailable as exc:
         await interaction.followup.send(
-            messages.get(str(error), "Lookup failed. Try again.")
+            f"TекkenDocs is currently unavailable: {exc}"
         )
 
-    except (aiohttp.ClientError, TimeoutError) as error:
-        print(f"TekkenDocs connection error: {error}")
+    except TekkenDocsError as exc:
         await interaction.followup.send(
-            "TekkenDocs unavailable or timed out. Retry shortly."
+            f"Could not retrieve frame data: {exc}"
         )
 
-    except Exception as error:
-        print(f"Frame-data lookup error: {error}")
+    except Exception as exc:
+        print(f"/fd error: {type(exc).__name__}: {exc}")
         await interaction.followup.send(
-            "Lookup failed. Retry; report it if it persists."
+            "An unexpected error occurred while looking up frame data."
         )
 
 
@@ -341,20 +205,28 @@ async def character_autocomplete(
     interaction: discord.Interaction,
     current: str,
 ):
-    query = normalize_character(current)
+    try:
+        roster = await source.get_roster()
+    except TekkenDocsError:
+        return []
 
-    matches = [
-        app_commands.Choice(name=name, value=slug)
-        for slug, name in CHARACTERS.items()
-        if query in slug or query in name.lower()
-    ]
+    current_normalized = normalize_character(current)
 
-    return matches[:25]
+    choices = []
+    for slug, name in roster.items():
+        if (
+            current_normalized in normalize_character(name)
+            or current_normalized in slug
+        ):
+            choices.append(
+                app_commands.Choice(name=name[:100], value=slug[:100])
+            )
 
+        if len(choices) >= 25:
+            break
 
-@client.event
-async def on_ready():
-    print(f"Logged in as {client.user}")
+    return choices
 
 
 client.run(TOKEN)
+```
