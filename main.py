@@ -1,13 +1,15 @@
-```python
+
 import os
 import re
-import discord
+from urllib.parse import quote
 
+import discord
 from discord import app_commands
 from discord.ext import commands
 
 from tekkendocs import (
     source,
+    normalize_move,
     TekkenDocsError,
     SourceUnavailable,
     CharacterNotFound,
@@ -16,10 +18,8 @@ from tekkendocs import (
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 
-intents = discord.Intents.default()
 
-
-def normalize_character(value):
+def character_slug(value):
     value = value.strip().lower()
     value = value.replace("&", "and")
     value = re.sub(r"\s+", "-", value)
@@ -27,39 +27,29 @@ def normalize_character(value):
     return value.strip("-")
 
 
-def normalize_move(value):
-    value = value.strip().casefold()
-    value = re.sub(r"\s+", "", value)
+def make_move_url(slug, command):
+    # TekkenDocs documents command pages using /character/command.
+    # Convert common notation separators to the compact URL notation.
+    compact = command.strip().lower()
+    compact = compact.replace(" ", "")
+    compact = compact.replace(",", "")
+    compact = compact.replace("/", "")
+    compact = compact.replace("+", "")
+    compact = compact.replace("*", "")
+    compact = re.sub(r"[^a-z0-9]", "", compact)
 
-    replacements = {
-        "df": "d/f",
-        "db": "d/b",
-        "uf": "u/f",
-        "ub": "u/b",
-        "ff": "f,f",
-    }
+    if compact:
+        return f"https://tekkendocs.com/{slug}/{quote(compact)}"
 
-    for old, new in replacements.items():
-        value = re.sub(rf"(?<![a-z]){old}(?=\+?\d)", new, value)
-
-    # d/f1 becomes d/f+1; 1+2 remains unchanged.
-    value = re.sub(r"([dfub])(\d)", r"\1+\2", value)
-    value = re.sub(r"([dfub])([dfub])(\d)", r"\1/\2+\3", value)
-
-    return value
+    return f"https://tekkendocs.com/{slug}"
 
 
-def move_matches(query, command):
-    return normalize_move(query) == normalize_move(command)
-
-
-def make_embed(character_name, move, stale=False):
-    slug = move.get("characterId", "")
+def make_embed(character_name, slug, move, stale=False):
     command = move.get("command", "Unknown move")
 
     embed = discord.Embed(
         title=f"{character_name} — {command}",
-        url=f"https://tekkendocs.com/{slug}/{command}",
+        url=make_move_url(slug, command),
         color=discord.Color.blurple(),
     )
 
@@ -67,13 +57,14 @@ def make_embed(character_name, move, stale=False):
         ("Hit level", "hitLevel"),
         ("Damage", "damage"),
         ("Startup", "startup"),
-        ("On block", "block"),
-        ("On hit", "hit"),
+        ("Block", "block"),
+        ("Hit", "hit"),
         ("Counter hit", "counterHit"),
     ]
 
     for label, key in fields:
-        value = move.get(key)
+        value = move.get(key, "")
+
         if value is not None and str(value).strip():
             embed.add_field(
                 name=label,
@@ -81,7 +72,8 @@ def make_embed(character_name, move, stale=False):
                 inline=True,
             )
 
-    notes = move.get("notes")
+    notes = move.get("notes", "")
+
     if notes and str(notes).strip():
         embed.add_field(
             name="Notes",
@@ -91,15 +83,20 @@ def make_embed(character_name, move, stale=False):
 
     if stale:
         embed.set_footer(
-            text="TekkenDocs is unavailable. Showing previously cached data; it may be outdated."
+            text=(
+                "TekkenDocs is unavailable. Showing cached data "
+                "which may be outdated."
+            )
         )
     else:
-        embed.set_footer(text="Frame data source: TekkenDocs / RBNorway")
+        embed.set_footer(
+            text="Frame data: TekkenDocs / RBNorway"
+        )
 
     return embed
 
 
-class Tekken7Client(commands.Bot):
+class Tekken7Bot(commands.Bot):
     async def setup_hook(self):
         await source.start()
         await self.tree.sync()
@@ -109,24 +106,26 @@ class Tekken7Client(commands.Bot):
         await super().close()
 
 
-client = Tekken7Client(
+intents = discord.Intents.default()
+
+bot = Tekken7Bot(
     command_prefix="!",
     intents=intents,
 )
 
 
-@client.event
+@bot.event
 async def on_ready():
-    print(f"Logged in as {client.user}.")
+    print(f"Tekken 7 bot logged in as {bot.user}")
 
 
-@client.tree.command(
+@bot.tree.command(
     name="fd",
-    description="Look up Tekken 7 frame data for a character move.",
+    description="Look up Tekken 7 frame data.",
 )
 @app_commands.describe(
-    character="Tekken 7 character",
-    move="Move notation, e.g. df1, 1+2, or qcf2",
+    character="Choose a Tekken 7 character.",
+    move="Enter a move, for example df1, 1+2, or qcf2.",
 )
 async def fd(
     interaction: discord.Interaction,
@@ -137,43 +136,49 @@ async def fd(
 
     try:
         roster = await source.get_roster()
-        character_slug = normalize_character(character)
 
-        # Resolve either the source slug or the displayed character name.
-        if character_slug not in roster:
+        requested_slug = character_slug(character)
+
+        # Autocomplete supplies the slug. Also accept a displayed character name.
+        if requested_slug not in roster:
             matches = [
-                slug for slug, name in roster.items()
-                if normalize_character(name) == character_slug
+                slug
+                for slug, name in roster.items()
+                if character_slug(name) == requested_slug
             ]
+
             if not matches:
                 await interaction.followup.send(
-                    f"Character **{character}** was not found in the TekkenDocs Tekken 7 roster."
+                    f"Character **{character}** was not found "
+                    "in the TekkenDocs Tekken 7 roster."
                 )
                 return
-            character_slug = matches[0]
 
-        character_data, stale = await source.get_character(character_slug)
-        moves = character_data["framesNormal"]
+            requested_slug = matches[0]
+
+        data, stale = await source.get_character(requested_slug)
+
+        normalized_query = normalize_move(move)
 
         found = next(
             (
-                item for item in moves
-                if move_matches(move, item.get("command", ""))
+                item
+                for item in data["framesNormal"]
+                if normalize_move(item.get("command", "")) == normalized_query
             ),
             None,
         )
 
-        if not found:
+        if found is None:
             await interaction.followup.send(
-                f"Move **{move}** was not found for **{character_data['characterName']}**."
+                f"Move **{move}** was not found for "
+                f"**{data['characterName']}**."
             )
             return
 
-        found = dict(found)
-        found["characterId"] = character_slug
-
         embed = make_embed(
-            character_data["characterName"],
+            data["characterName"],
+            requested_slug,
             found,
             stale=stale,
         )
@@ -194,7 +199,9 @@ async def fd(
         )
 
     except Exception as exc:
-        print(f"/fd error: {type(exc).__name__}: {exc}")
+        print(
+            f"/fd error: {type(exc).__name__}: {exc}"
+        )
         await interaction.followup.send(
             "An unexpected error occurred while looking up frame data."
         )
@@ -210,16 +217,20 @@ async def character_autocomplete(
     except TekkenDocsError:
         return []
 
-    current_normalized = normalize_character(current)
+    query = character_slug(current)
 
     choices = []
+
     for slug, name in roster.items():
         if (
-            current_normalized in normalize_character(name)
-            or current_normalized in slug
+            query in character_slug(name)
+            or query in slug
         ):
             choices.append(
-                app_commands.Choice(name=name[:100], value=slug[:100])
+                app_commands.Choice(
+                    name=name[:100],
+                    value=slug[:100],
+                )
             )
 
         if len(choices) >= 25:
@@ -228,5 +239,4 @@ async def character_autocomplete(
     return choices
 
 
-client.run(TOKEN)
-```
+bot.run(TOKEN)
