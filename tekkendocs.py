@@ -1,7 +1,6 @@
-```python
+
 import asyncio
 import json
-import os
 import re
 import time
 from html.parser import HTMLParser
@@ -12,7 +11,7 @@ import aiohttp
 
 
 BASE_URL = "https://tekkendocs.com"
-T7_PAGE_URL = f"{BASE_URL}/t7"
+ROSTER_URL = f"{BASE_URL}/t7/"
 API_URL = f"{BASE_URL}/api/t7/{{slug}}/framedata"
 
 CACHE_TTL = 300
@@ -20,7 +19,7 @@ REQUEST_TIMEOUT = 20
 CACHE_DIR = Path("data") / "tekkendocs"
 
 HEADERS = {
-    "User-Agent": "Tekken7FrameDataDiscordBot/1.0"
+    "User-Agent": "Tekken7FrameDataBot/1.0"
 }
 
 
@@ -32,116 +31,127 @@ class SourceUnavailable(TekkenDocsError):
     pass
 
 
-class CharacterNotFound(TekkenDocsError):
-    pass
-
-
 class InvalidFrameData(TekkenDocsError):
     pass
 
 
-class _RosterParser(HTMLParser):
-    """Collect character links from the TekkenDocs T7 page."""
+class CharacterNotFound(TekkenDocsError):
+    pass
 
+
+class RosterParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.links = []
-        self._href = None
-        self._text = []
+        self.href = None
+        self.text = []
 
     def handle_starttag(self, tag, attrs):
         if tag.lower() == "a":
             attrs = dict(attrs)
-            self._href = attrs.get("href")
-            self._text = []
+            self.href = attrs.get("href")
+            self.text = []
 
     def handle_data(self, data):
-        if self._href is not None:
-            self._text.append(data)
+        if self.href is not None:
+            self.text.append(data)
 
     def handle_endtag(self, tag):
-        if tag.lower() == "a" and self._href is not None:
-            label = " ".join("".join(self._text).split())
-            self.links.append((self._href, label))
-            self._href = None
-            self._text = []
+        if tag.lower() == "a" and self.href is not None:
+            self.links.append(
+                (self.href, " ".join("".join(self.text).split()))
+            )
+            self.href = None
+            self.text = []
 
 
-def _slugify(value):
+def slugify(value):
     value = value.strip().lower()
     value = value.replace("&", "and")
     value = re.sub(r"[^a-z0-9]+", "-", value)
     return value.strip("-")
 
 
-def _valid_slug(value):
-    return bool(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", value))
+def normalize_move(value):
+    value = value.casefold().strip()
+    value = re.sub(r"\s+", "", value)
+
+    replacements = {
+        "df": "d/f",
+        "db": "d/b",
+        "uf": "u/f",
+        "ub": "u/b",
+        "ff": "f,f",
+    }
+
+    for old, new in replacements.items():
+        value = re.sub(
+            rf"(?<![a-z]){old}(?=\+?\d)",
+            new,
+            value
+        )
+
+    # Remove the optional plus between a direction and its first button.
+    value = re.sub(r"([dfub])\+(?=\d)", r"\1", value)
+
+    return value
 
 
-def _extract_roster(html):
-    parser = _RosterParser()
+def extract_roster(html):
+    parser = RosterParser()
     parser.feed(html)
 
-    characters = {}
-
-    excluded = {
-        "t7", "t8", "features", "credits", "about", "all",
-        "login", "register", "settings", "guides", "meta",
-        "challenges", "stats", "rank", "leaderboards"
-    }
+    roster = {}
 
     for href, label in parser.links:
         if not href or not label:
             continue
 
         parsed = urlparse(href)
-        path = parsed.path.strip("/")
-        parts = [part for part in path.split("/") if part]
+        parts = [part for part in parsed.path.split("/") if part]
 
-        if not parts:
+        # Tekken 7 character links are under /t7/<character>.
+        if len(parts) < 2 or parts[0].lower() != "t7":
             continue
 
-        # Accept character links in either /character or /t7/character form.
-        if len(parts) == 2 and parts[0].lower() == "t7":
-            slug = parts[1].lower()
-        elif len(parts) == 1:
-            slug = parts[0].lower()
-        else:
+        slug = parts[1].lower()
+
+        if not re.fullmatch(r"[a-z0-9-]+", slug):
             continue
 
-        if slug in excluded or not _valid_slug(slug):
+        # Avoid adding non-character navigation links.
+        if slug in {
+            "all", "characters", "guides", "features",
+            "stats", "challenges", "meta", "rank"
+        }:
             continue
 
-        # Ignore links that are not character labels.
-        if len(label) > 40:
-            continue
+        roster[slug] = label
 
-        characters[slug] = label
-
-    if not characters:
+    if not roster:
         raise InvalidFrameData(
-            "TekkenDocs roster page did not expose any character links."
+            "Could not discover characters from the TekkenDocs T7 page."
         )
 
-    return dict(sorted(characters.items(), key=lambda item: item[1].casefold()))
+    return dict(
+        sorted(roster.items(), key=lambda item: item[1].casefold())
+    )
 
 
-def _validate_frame_data(data, slug):
+def validate_character_data(data, slug):
     if not isinstance(data, dict):
-        raise InvalidFrameData("The JSON response was not an object.")
+        raise InvalidFrameData("Frame-data JSON is not an object.")
 
-    character_name = data.get("characterName")
+    name = data.get("characterName")
     moves = data.get("framesNormal")
 
-    if not isinstance(character_name, str) or not character_name.strip():
-        raise InvalidFrameData("The JSON response has no characterName.")
+    if not isinstance(name, str) or not name.strip():
+        raise InvalidFrameData("Missing characterName in JSON.")
 
     if not isinstance(moves, list) or not moves:
-        raise InvalidFrameData("The JSON response has no valid framesNormal list.")
+        raise InvalidFrameData("Missing or empty framesNormal list.")
 
-    valid_moves = []
-
-    required_fields = (
+    required = (
         "command",
         "hitLevel",
         "damage",
@@ -151,6 +161,8 @@ def _validate_frame_data(data, slug):
         "counterHit",
     )
 
+    cleaned_moves = []
+
     for move in moves:
         if not isinstance(move, dict):
             continue
@@ -159,24 +171,24 @@ def _validate_frame_data(data, slug):
         if not isinstance(command, str) or not command.strip():
             continue
 
-        # Preserve the source fields, including optional notes and identifiers.
         cleaned = dict(move)
-        for field in required_fields:
-            value = cleaned.get(field, "")
-            if value is None:
-                cleaned[field] = ""
-            elif not isinstance(value, (str, int, float)):
-                cleaned[field] = str(value)
 
-        valid_moves.append(cleaned)
+        for key in required:
+            value = cleaned.get(key, "")
+            cleaned[key] = "" if value is None else str(value)
 
-    if not valid_moves:
-        raise InvalidFrameData("No usable moves were found in framesNormal.")
+        if cleaned.get("notes") is None:
+            cleaned["notes"] = ""
+
+        cleaned_moves.append(cleaned)
+
+    if not cleaned_moves:
+        raise InvalidFrameData("No valid moves were found in the JSON.")
 
     return {
-        "characterName": character_name.strip(),
+        "characterName": name.strip(),
         "characterSlug": slug,
-        "framesNormal": valid_moves,
+        "framesNormal": cleaned_moves,
     }
 
 
@@ -184,59 +196,62 @@ class TekkenDocs:
     def __init__(self):
         self.session = None
         self.roster = {}
-        self.roster_loaded_at = 0
+        self.roster_fetched_at = 0
         self.roster_lock = asyncio.Lock()
         self.character_locks = {}
 
     async def start(self):
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
         self.session = aiohttp.ClientSession(
             timeout=timeout,
-            headers=HEADERS
+            headers=HEADERS,
         )
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     async def close(self):
         if self.session:
             await self.session.close()
             self.session = None
 
-    async def _get_text(self, url):
+    async def _request_text(self, url):
         try:
             async with self.session.get(url) as response:
                 if response.status == 404:
-                    raise SourceUnavailable("TekkenDocs returned 404.")
+                    raise SourceUnavailable("TekkenDocs page was not found.")
                 if response.status == 429:
-                    raise SourceUnavailable("TekkenDocs rate-limited the request.")
+                    raise SourceUnavailable("TekkenDocs rate-limited the bot.")
                 if response.status >= 500:
                     raise SourceUnavailable(
-                        f"TekkenDocs server error ({response.status})."
+                        f"TekkenDocs server error: {response.status}"
                     )
                 if response.status != 200:
                     raise SourceUnavailable(
                         f"TekkenDocs returned HTTP {response.status}."
                     )
 
-                text = await response.text()
-                if not text.strip():
-                    raise SourceUnavailable("TekkenDocs returned an empty response.")
-                return text
+                body = await response.text()
+
+                if not body.strip():
+                    raise SourceUnavailable("TekkenDocs returned an empty page.")
+
+                return body
 
         except asyncio.TimeoutError as exc:
             raise SourceUnavailable("TekkenDocs request timed out.") from exc
         except aiohttp.ClientError as exc:
             raise SourceUnavailable("Could not connect to TekkenDocs.") from exc
 
-    async def _get_json(self, url):
+    async def _request_json(self, url):
         try:
             async with self.session.get(url) as response:
                 if response.status == 404:
-                    raise SourceUnavailable("Frame-data endpoint was not found.")
+                    raise SourceUnavailable("Character JSON endpoint was not found.")
                 if response.status == 429:
-                    raise SourceUnavailable("TekkenDocs rate-limited the request.")
+                    raise SourceUnavailable("TekkenDocs rate-limited the bot.")
                 if response.status >= 500:
                     raise SourceUnavailable(
-                        f"TekkenDocs server error ({response.status})."
+                        f"TekkenDocs server error: {response.status}"
                     )
                 if response.status != 200:
                     raise SourceUnavailable(
@@ -255,59 +270,115 @@ class TekkenDocs:
         except aiohttp.ClientError as exc:
             raise SourceUnavailable("Could not connect to TekkenDocs.") from exc
 
-    async def get_roster(self, force_refresh=False):
-        now = time.monotonic()
+    def _roster_cache_path(self):
+        return CACHE_DIR / "roster.json"
 
-        if (
-            self.roster
-            and not force_refresh
-            and now - self.roster_loaded_at < CACHE_TTL
-        ):
-            return self.roster
-
-        async with self.roster_lock:
-            now = time.monotonic()
-            if (
-                self.roster
-                and not force_refresh
-                and now - self.roster_loaded_at < CACHE_TTL
-            ):
-                return self.roster
-
-            try:
-                html = await self._get_text(T7_PAGE_URL)
-                roster = _extract_roster(html)
-                self.roster = roster
-                self.roster_loaded_at = time.monotonic()
-                return self.roster
-
-            except (SourceUnavailable, InvalidFrameData):
-                if self.roster:
-                    return self.roster
-                raise
-
-    def _cache_path(self, slug):
-        return CACHE_DIR / f"{slug}.json"
-
-    def _read_cache(self, slug):
-        path = self._cache_path(slug)
-        if not path.exists():
-            return None
+    def _load_roster_cache(self):
+        path = self._roster_cache_path()
 
         try:
             with path.open("r", encoding="utf-8") as file:
                 cached = json.load(file)
 
-            data = _validate_frame_data(cached["data"], slug)
+            roster = cached["roster"]
             fetched_at = float(cached["fetched_at"])
-            return data, fetched_at
 
-        except (OSError, ValueError, KeyError, TypeError, InvalidFrameData):
+            if not isinstance(roster, dict) or not roster:
+                return None
+
+            return roster, fetched_at
+
+        except (OSError, ValueError, KeyError, TypeError):
             return None
 
-    def _write_cache(self, slug, data):
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        path = self._cache_path(slug)
+    def _save_roster_cache(self, roster):
+        path = self._roster_cache_path()
+        temporary = path.with_suffix(".tmp")
+
+        payload = {
+            "fetched_at": time.time(),
+            "roster": roster,
+        }
+
+        with temporary.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False)
+
+        temporary.replace(path)
+
+    async def get_roster(self):
+        now = time.time()
+
+        if (
+            self.roster
+            and now - self.roster_fetched_at < CACHE_TTL
+        ):
+            return self.roster
+
+        async with self.roster_lock:
+            now = time.time()
+
+            if (
+                self.roster
+                and now - self.roster_fetched_at < CACHE_TTL
+            ):
+                return self.roster
+
+            disk_cache = self._load_roster_cache()
+
+            if disk_cache:
+                cached_roster, cached_time = disk_cache
+                if now - cached_time < CACHE_TTL:
+                    self.roster = cached_roster
+                    self.roster_fetched_at = cached_time
+                    return self.roster
+
+            try:
+                html = await self._request_text(ROSTER_URL)
+                roster = extract_roster(html)
+
+                self._save_roster_cache(roster)
+                self.roster = roster
+                self.roster_fetched_at = time.time()
+
+                return self.roster
+
+            except (SourceUnavailable, InvalidFrameData):
+                if self.roster:
+                    return self.roster
+
+                if disk_cache:
+                    self.roster = disk_cache[0]
+                    self.roster_fetched_at = disk_cache[1]
+                    return self.roster
+
+                raise
+
+    def _character_cache_path(self, slug):
+        return CACHE_DIR / f"{slug}.json"
+
+    def _load_character_cache(self, slug):
+        path = self._character_cache_path(slug)
+
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                cached = json.load(file)
+
+            data = validate_character_data(cached["data"], slug)
+            fetched_at = float(cached["fetched_at"])
+
+            return data, fetched_at
+
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            InvalidFrameData,
+        ):
+            return None
+
+    def _save_character_cache(self, slug, data):
+        path = self._character_cache_path(slug)
         temporary = path.with_suffix(".tmp")
 
         payload = {
@@ -321,28 +392,33 @@ class TekkenDocs:
         temporary.replace(path)
 
     async def get_character(self, slug):
-        slug = _slugify(slug)
+        slug = slugify(slug)
 
-        if not _valid_slug(slug):
+        if not re.fullmatch(r"[a-z0-9-]+", slug):
             raise CharacterNotFound("Invalid character name.")
 
-        lock = self.character_locks.setdefault(slug, asyncio.Lock())
+        lock = self.character_locks.setdefault(
+            slug,
+            asyncio.Lock()
+        )
 
         async with lock:
-            cached = self._read_cache(slug)
+            cached = self._load_character_cache(slug)
             now = time.time()
 
-            if cached:
-                cached_data, fetched_at = cached
-                if now - fetched_at < CACHE_TTL:
-                    return cached_data, False
+            if cached and now - cached[1] < CACHE_TTL:
+                return cached[0], False
 
             try:
-                raw_data = await self._get_json(API_URL.format(slug=slug))
-                data = _validate_frame_data(raw_data, slug)
+                raw = await self._request_json(
+                    API_URL.format(slug=slug)
+                )
 
-                # Only replace a cache after the new response passes validation.
-                self._write_cache(slug, data)
+                data = validate_character_data(raw, slug)
+
+                # Replace the old cache only after validating fresh JSON.
+                self._save_character_cache(slug, data)
+
                 return data, False
 
             except (SourceUnavailable, InvalidFrameData):
@@ -352,4 +428,3 @@ class TekkenDocs:
 
 
 source = TekkenDocs()
-```
