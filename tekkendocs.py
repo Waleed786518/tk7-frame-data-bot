@@ -73,26 +73,46 @@ def slugify(value):
 
 
 def normalize_move(value):
-    value = value.casefold().strip()
+    """
+    Normalize Tekken move notation so shorthand and slash notation match.
+
+    Examples:
+        uf2   -> u/f2
+        u/f2  -> u/f2
+        u/f+2 -> u/f2
+        df1   -> d/f1
+        db2   -> d/b2
+        ub2   -> u/b2
+        ff2   -> f,f2
+        u     -> u
+        1+2   -> 1+2
+    """
+    value = str(value).casefold().strip()
     value = re.sub(r"\s+", "", value)
 
-    replacements = {
-        "df": "d/f",
-        "db": "d/b",
-        "uf": "u/f",
-        "ub": "u/b",
-        "ff": "f,f",
-    }
+    # Convert shorthand diagonal directions to slash notation.
+    # This deliberately requires a following button number so that
+    # direction-only inputs such as "u" remain unchanged.
+    value = re.sub(
+        r"(?<![a-z])([ud])([fb])(?=\+?\d)",
+        r"\1/\2",
+        value,
+    )
 
-    for old, new in replacements.items():
-        value = re.sub(
-            rf"(?<![a-z]){old}(?=\+?\d)",
-            new,
-            value
-        )
+    # Normalize forward dash notation.
+    value = re.sub(
+        r"(?<![a-z])ff(?=\+?\d)",
+        "f,f",
+        value,
+    )
 
-    # Remove the optional plus between a direction and its first button.
-    value = re.sub(r"([dfub])\+(?=\d)", r"\1", value)
+    # Remove optional plus between a direction and its button.
+    # This does not remove button combinations such as 1+2.
+    value = re.sub(
+        r"([dfub])\+(?=\d)",
+        r"\1",
+        value,
+    )
 
     return value
 
@@ -110,7 +130,6 @@ def extract_roster(html):
         parsed = urlparse(href)
         parts = [part for part in parsed.path.split("/") if part]
 
-        # Tekken 7 character links are under /t7/<character>.
         if len(parts) < 2 or parts[0].lower() != "t7":
             continue
 
@@ -119,10 +138,15 @@ def extract_roster(html):
         if not re.fullmatch(r"[a-z0-9-]+", slug):
             continue
 
-        # Avoid adding non-character navigation links.
         if slug in {
-            "all", "characters", "guides", "features",
-            "stats", "challenges", "meta", "rank"
+            "all",
+            "characters",
+            "guides",
+            "features",
+            "stats",
+            "challenges",
+            "meta",
+            "rank",
         }:
             continue
 
@@ -168,6 +192,7 @@ def validate_character_data(data, slug):
             continue
 
         command = move.get("command")
+
         if not isinstance(command, str) or not command.strip():
             continue
 
@@ -204,6 +229,7 @@ class TekkenDocs:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+
         self.session = aiohttp.ClientSession(
             timeout=timeout,
             headers=HEADERS,
@@ -218,13 +244,20 @@ class TekkenDocs:
         try:
             async with self.session.get(url) as response:
                 if response.status == 404:
-                    raise SourceUnavailable("TekkenDocs page was not found.")
+                    raise SourceUnavailable(
+                        "TekkenDocs page was not found."
+                    )
+
                 if response.status == 429:
-                    raise SourceUnavailable("TekkenDocs rate-limited the bot.")
+                    raise SourceUnavailable(
+                        "TekkenDocs rate-limited the bot."
+                    )
+
                 if response.status >= 500:
                     raise SourceUnavailable(
                         f"TekkenDocs server error: {response.status}"
                     )
+
                 if response.status != 200:
                     raise SourceUnavailable(
                         f"TekkenDocs returned HTTP {response.status}."
@@ -233,26 +266,40 @@ class TekkenDocs:
                 body = await response.text()
 
                 if not body.strip():
-                    raise SourceUnavailable("TekkenDocs returned an empty page.")
+                    raise SourceUnavailable(
+                        "TekkenDocs returned an empty page."
+                    )
 
                 return body
 
         except asyncio.TimeoutError as exc:
-            raise SourceUnavailable("TekkenDocs request timed out.") from exc
+            raise SourceUnavailable(
+                "TekkenDocs request timed out."
+            ) from exc
+
         except aiohttp.ClientError as exc:
-            raise SourceUnavailable("Could not connect to TekkenDocs.") from exc
+            raise SourceUnavailable(
+                "Could not connect to TekkenDocs."
+            ) from exc
 
     async def _request_json(self, url):
         try:
             async with self.session.get(url) as response:
                 if response.status == 404:
-                    raise SourceUnavailable("Character JSON endpoint was not found.")
+                    raise SourceUnavailable(
+                        "Character JSON endpoint was not found."
+                    )
+
                 if response.status == 429:
-                    raise SourceUnavailable("TekkenDocs rate-limited the bot.")
+                    raise SourceUnavailable(
+                        "TekkenDocs rate-limited the bot."
+                    )
+
                 if response.status >= 500:
                     raise SourceUnavailable(
                         f"TekkenDocs server error: {response.status}"
                     )
+
                 if response.status != 200:
                     raise SourceUnavailable(
                         f"TekkenDocs returned HTTP {response.status}."
@@ -260,15 +307,21 @@ class TekkenDocs:
 
                 try:
                     return await response.json(content_type=None)
+
                 except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
                     raise InvalidFrameData(
                         "TekkenDocs returned invalid JSON."
                     ) from exc
 
         except asyncio.TimeoutError as exc:
-            raise SourceUnavailable("TekkenDocs request timed out.") from exc
+            raise SourceUnavailable(
+                "TekkenDocs request timed out."
+            ) from exc
+
         except aiohttp.ClientError as exc:
-            raise SourceUnavailable("Could not connect to TekkenDocs.") from exc
+            raise SourceUnavailable(
+                "Could not connect to TekkenDocs."
+            ) from exc
 
     def _roster_cache_path(self):
         return CACHE_DIR / "roster.json"
@@ -327,6 +380,7 @@ class TekkenDocs:
 
             if disk_cache:
                 cached_roster, cached_time = disk_cache
+
                 if now - cached_time < CACHE_TTL:
                     self.roster = cached_roster
                     self.roster_fetched_at = cached_time
@@ -337,6 +391,7 @@ class TekkenDocs:
                 roster = extract_roster(html)
 
                 self._save_roster_cache(roster)
+
                 self.roster = roster
                 self.roster_fetched_at = time.time()
 
@@ -399,7 +454,7 @@ class TekkenDocs:
 
         lock = self.character_locks.setdefault(
             slug,
-            asyncio.Lock()
+            asyncio.Lock(),
         )
 
         async with lock:
@@ -424,6 +479,7 @@ class TekkenDocs:
             except (SourceUnavailable, InvalidFrameData):
                 if cached:
                     return cached[0], True
+
                 raise
 
 
